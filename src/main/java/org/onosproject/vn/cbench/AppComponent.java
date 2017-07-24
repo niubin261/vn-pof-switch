@@ -21,19 +21,28 @@ import org.apache.felix.scr.annotations.Deactivate;
 import org.apache.felix.scr.annotations.Reference;
 import org.apache.felix.scr.annotations.ReferenceCardinality;
 import org.onlab.packet.Ethernet;
+import org.onosproject.cluster.ClusterService;
+import org.onosproject.cluster.NodeId;
 import org.onosproject.core.ApplicationId;
 import org.onosproject.core.CoreService;
+import org.onosproject.floodlightpof.protocol.action.OFAction;
 import org.onosproject.incubator.net.virtual.NetworkId;
 import org.onosproject.incubator.net.virtual.TenantId;
 import org.onosproject.incubator.net.virtual.VirtualNetwork;
 import org.onosproject.incubator.net.virtual.VirtualNetworkAdminService;
+import org.onosproject.mastership.MastershipService;
+import org.onosproject.net.Device;
+import org.onosproject.net.DeviceId;
 import org.onosproject.net.Path;
 import org.onosproject.net.PortNumber;
+import org.onosproject.net.device.DeviceService;
 import org.onosproject.net.flow.DefaultTrafficSelector;
 import org.onosproject.net.flow.DefaultTrafficTreatment;
 import org.onosproject.net.flow.FlowRuleService;
 import org.onosproject.net.flow.TrafficSelector;
 import org.onosproject.net.flow.TrafficTreatment;
+import org.onosproject.net.flow.instructions.DefaultPofActions;
+import org.onosproject.net.flow.instructions.DefaultPofInstructions;
 import org.onosproject.net.flowobjective.DefaultForwardingObjective;
 import org.onosproject.net.flowobjective.FlowObjectiveService;
 import org.onosproject.net.flowobjective.ForwardingObjective;
@@ -44,6 +53,9 @@ import org.onosproject.net.packet.PacketProcessor;
 import org.onosproject.net.packet.PacketService;
 import org.onosproject.net.topology.TopologyService;
 
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Set;
 
 import org.slf4j.Logger;
@@ -66,6 +78,15 @@ public class AppComponent {
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
     protected CoreService coreService;
 
+    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
+    protected ClusterService clusterService;
+
+    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
+    protected MastershipService mastershipService;
+
+    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
+    protected DeviceService deviceService;
+
     private TopologyService topologyService;
     private PacketService packetService;
     private HostService hostService;
@@ -76,6 +97,10 @@ public class AppComponent {
 
 
     private ApplicationId appId;
+    private NodeId local;
+    private NodeId master;
+    private DeviceId deviceId;
+
 
     private int flowPriority = DEFAULT_PRIORITY;
 
@@ -84,103 +109,72 @@ public class AppComponent {
     @Activate
     public void activate() {
         NetworkId vnetId = NetworkId.networkId(1);
-
-        topologyService = vnaService.get(vnetId, TopologyService.class);
+        local = clusterService.getLocalNode().id();
+        Iterator<Device> devices = deviceService.getAvailableDevices().iterator();
+        while (devices.hasNext()){
+            deviceId = devices.next().id();
+        }
+        master = mastershipService.getMasterFor(deviceId);
         packetService = vnaService.get(vnetId, PacketService.class);
-        hostService = vnaService.get(vnetId, HostService.class);
-        flowRuleService = vnaService.get(vnetId, FlowRuleService.class);
-        flowObjectiveService = vnaService.get(vnetId, FlowObjectiveService.class);
+        if(local.equals(master)){
 
+            log.info("packetService: {}", packetService);
+            //hostService = vnaService.get(vnetId, HostService.class);
+            //flowRuleService = vnaService.get(vnetId, FlowRuleService.class);
+            //flowObjectiveService = vnaService.get(vnetId, FlowObjectiveService.class);
+
+            packetService.addProcessor(processor, PacketProcessor.director(2));
+        }
+
+        //topologyService = vnaService.get(vnetId, TopologyService.class);
         appId = coreService.registerApplication("org.onosproject.vn.cbench");
 
-        packetService.addProcessor(processor, PacketProcessor.director(2));
 
         log.info("Started", appId.id());
     }
 
     @Deactivate
     public void deactivate() {
-        flowRuleService.removeFlowRulesById(appId);
-        packetService.removeProcessor(processor);
+        //flowRuleService.removeFlowRulesById(appId);
+        if(local.equals(master)){
+
+            packetService.removeProcessor(processor);
+        }
 
         processor = null;
         log.info("Stopped");
     }
 
-    // Indicates whether this is a control packet, e.g. LLDP, BDDP
-    private boolean isControlPacket(Ethernet eth) {
-        short type = eth.getEtherType();
-        return type == Ethernet.TYPE_LLDP || type == Ethernet.TYPE_BSN;
-    }
 
-    // Floods the specified packet if permissible.
-    private void flood(PacketContext context) {
-        if (topologyService.isBroadcastPoint(topologyService.currentTopology(),
-                context.inPacket().receivedFrom())) {
-            packetOut(context, PortNumber.FLOOD);
-        } else {
-            context.block();
-        }
-    }
 
-    private Path pickForwardPathIfPossible(Set<Path> paths, PortNumber notToPort) {
-        Path lastPath = null;
-        for (Path path : paths) {
-            lastPath = path;
-            if (!path.src().port().equals(notToPort)) {
-                return path;
-            }
-        }
-        return lastPath;
-    }
 
     // Sends a packet out the specified port.
     private void packetOut(PacketContext context, PortNumber portNumber) {
+//        List<OFAction> actions=new ArrayList<>();
+//        actions.add(DefaultPofActions.output((short)0, (short)0, (short)0, (int)portNumber.toLong()).action());
+//        context.treatmentBuilder().add(DefaultPofInstructions.applyActions(actions));
         context.treatmentBuilder().setOutput(portNumber);
         context.send();
     }
 
-    private void installRule(PacketContext context, PortNumber portNumber) {
-        Ethernet inPkt = context.inPacket().parsed();
-        // If ARP packet than forward directly to output port
-        if (inPkt.getEtherType() == Ethernet.TYPE_ARP) {
-            packetOut(context, portNumber);
-            return;
-        }
-        TrafficSelector.Builder selectorBuilder = DefaultTrafficSelector.builder();
-        selectorBuilder.matchEthDst(inPkt.getDestinationMAC());
-        TrafficTreatment treatment = DefaultTrafficTreatment.builder()
-                .setOutput(portNumber)
-                .build();
-        ForwardingObjective forwardingObjective = DefaultForwardingObjective.builder()
-                .withSelector(selectorBuilder.build())
-                .withTreatment(treatment)
-                .withPriority(flowPriority)
-                .withFlag(ForwardingObjective.Flag.VERSATILE)
-                .fromApp(appId)
-                .makeTemporary(flowTimeout)
-                .add();
-        flowObjectiveService.forward(context.inPacket().receivedFrom().deviceId(),
-                forwardingObjective);
-        packetOut(context, portNumber);
-    }
 
     private class ReactivePacketProcessor implements PacketProcessor {
         @Override
         public void process(PacketContext context) {
-
+            log.info("The packet is here process : packetout ready");
             // Stop processing if the packet has been handled, since we
             // can't do any more to it.
-            if (context.isHandled()) {
-                return;
-            }
+//            if (context.isHandled()) {
+//                return;
+//            }
             //log.info("====PacketProcessor gets unhandled packetIn packet");
-            InboundPacket pkt = context.inPacket();
-            Ethernet ethPkt = pkt.parsed();
+//            InboundPacket pkt = context.inPacket();
+//            Ethernet ethPkt = pkt.parsed();
+//
+//            if (ethPkt == null) {
+//                return;
+//            }
 
-            if (ethPkt == null) {
-                return;
-            }
 
             // Otherwise forward and be done with
             //installRule(context, PortNumber.portNumber(2));
